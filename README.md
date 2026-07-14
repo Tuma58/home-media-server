@@ -13,10 +13,10 @@
 ## Установка одной командой
 
 ```bash
-sudo bash -c 'set -Eeuo pipefail; apt-get update; apt-get install -y curl ca-certificates; tmp=$(mktemp); trap "rm -f $tmp" EXIT; curl -fsSL https://raw.githubusercontent.com/Tuma58/home-media-server/main/install.sh -o "$tmp"; bash "$tmp"'
+sudo bash -c 'set -Eeuo pipefail; apt-get update; apt-get install -y git ca-certificates; tmp=$(mktemp -d); trap "rm -rf -- $tmp" EXIT; for attempt in 1 2 3; do rm -rf -- "$tmp"; git -c http.version=HTTP/1.1 clone --depth 1 --single-branch https://github.com/Tuma58/home-media-server.git "$tmp" && break; sleep 5; done; test -f "$tmp/install.sh"; bash "$tmp/install.sh"'
 ```
 
-Команда устанавливает `curl`, скачивает актуальный скрипт во временный файл, запускает его и удаляет временный файл. Сам скрипт сохраняет команду управления `/usr/local/sbin/home-media-server`.
+Команда устанавливает `git`, за три попытки клонирует актуальную версию через основной домен `github.com`, запускает установщик и удаляет временный каталог. Принудительно используется HTTP/1.1 для совместимости с сетями, в которых соединения GitHub по HTTP/2 нестабильны. Сам скрипт сохраняет команду управления `/usr/local/sbin/home-media-server`.
 
 При первой установке создаются каталоги, пользователи, конфиги и правила UFW (только если UFW уже активен). Если пароли не переданы через окружение, скрипт генерирует случайные пароли и один раз показывает их в итоговой сводке.
 
