@@ -29,6 +29,7 @@ SAMBA_SHARE_NAME="${SAMBA_SHARE_NAME:-Media}"
 STATE_DIR="${STATE_DIR:-/etc/torrent-dlna}"
 INSTALL_MARKER="$STATE_DIR/installed"
 INSTALLING_MARKER="$STATE_DIR/installing"
+SECRETS_FILE="${SECRETS_FILE:-$STATE_DIR/secrets}"
 SAMBA_MAIN_CONF="${SAMBA_MAIN_CONF:-/etc/samba/smb.conf}"
 SAMBA_INCLUDE_DIR="${SAMBA_INCLUDE_DIR:-/etc/samba/smb.conf.d}"
 SAMBA_SHARES_CONF="${SAMBA_SHARES_CONF:-$SAMBA_INCLUDE_DIR/torrent-dlna-shares.conf}"
@@ -76,6 +77,54 @@ valid_single_line() {
 
 random_secret() {
     od -An -N16 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+read_secret_value() {
+    local key=$1
+    awk -v key="$key" '
+        index($0, key "=") == 1 { sub(/^[^=]*=/, ""); print; exit }
+    ' "$SECRETS_FILE"
+}
+
+load_saved_secrets() {
+    [[ -f "$SECRETS_FILE" ]] || return 1
+    chmod 600 "$SECRETS_FILE"
+
+    TRANSMISSION_USER=$(read_secret_value TRANSMISSION_USER)
+    TRANSMISSION_PASS=$(read_secret_value TRANSMISSION_PASS)
+    SAMBA_USER=$(read_secret_value SAMBA_USER)
+    SAMBA_PASS=$(read_secret_value SAMBA_PASS)
+
+    [[ -n "$TRANSMISSION_USER" && -n "$TRANSMISSION_PASS" && -n "$SAMBA_USER" && -n "$SAMBA_PASS" ]] || \
+        err "Файл секретов повреждён или неполон: $SECRETS_FILE"
+    log "Используются сохранённые учётные данные: $SECRETS_FILE"
+}
+
+save_secrets() {
+    local tmp
+    mkdir -p -- "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    tmp=$(mktemp "$STATE_DIR/.secrets.XXXXXX")
+    chmod 600 "$tmp"
+    {
+        printf '# Home Media Server credentials. Root access only.\n'
+        printf 'TRANSMISSION_USER=%s\n' "$TRANSMISSION_USER"
+        printf 'TRANSMISSION_PASS=%s\n' "$TRANSMISSION_PASS"
+        printf 'SAMBA_USER=%s\n' "$SAMBA_USER"
+        printf 'SAMBA_PASS=%s\n' "$SAMBA_PASS"
+    } > "$tmp"
+    mv -f -- "$tmp" "$SECRETS_FILE"
+    chmod 600 "$SECRETS_FILE"
+    log "Учётные данные сохранены: $SECRETS_FILE"
+}
+
+validate_secret_values() {
+    [[ -n "$TRANSMISSION_PASS" ]] || err "Пустой TRANSMISSION_PASS запрещён"
+    [[ -n "$SAMBA_PASS" ]] || err "Пустой SAMBA_PASS запрещён"
+    valid_single_line "$TRANSMISSION_PASS" || err "TRANSMISSION_PASS должен быть в одной строке"
+    [[ "$TRANSMISSION_PASS" != \{* ]] || \
+        err "TRANSMISSION_PASS не должен начинаться с { (Transmission считает такой пароль уже хешированным)"
+    valid_single_line "$SAMBA_PASS" || err "SAMBA_PASS должен быть в одной строке"
 }
 
 json_escape() {
@@ -481,12 +530,18 @@ validate_config() {
     valid_share_name "$SAMBA_SHARE_NAME" || err "Некорректный SAMBA_SHARE_NAME"
     valid_absolute_path "$MEDIA_ROOT" || err "Некорректный MEDIA_ROOT"
     valid_absolute_path "$MANAGER_PATH" || err "Некорректный MANAGER_PATH"
+    valid_absolute_path "$SECRETS_FILE" || err "Некорректный SECRETS_FILE"
     valid_single_line "$DLNA_NAME" && [[ "$DLNA_NAME" != *'#'* ]] || \
         err "DLNA_NAME должен быть в одной строке и не содержать #"
     valid_single_line "$TRANSMISSION_USER" || err "TRANSMISSION_USER должен быть в одной строке"
 }
 
 initialise_secrets() {
+    if load_saved_secrets; then
+        validate_config
+        validate_secret_values
+        return 0
+    fi
     if [[ -z "$TRANSMISSION_PASS" ]]; then
         TRANSMISSION_PASS=$(random_secret)
         warn "Сгенерирован случайный пароль Transmission"
@@ -495,10 +550,8 @@ initialise_secrets() {
         SAMBA_PASS=$(random_secret)
         warn "Сгенерирован случайный пароль Samba"
     fi
-    valid_single_line "$TRANSMISSION_PASS" || err "TRANSMISSION_PASS должен быть в одной строке"
-    [[ "$TRANSMISSION_PASS" != \{* ]] || \
-        err "TRANSMISSION_PASS не должен начинаться с { (Transmission считает такой пароль уже хешированным)"
-    valid_single_line "$SAMBA_PASS" || err "SAMBA_PASS должен быть в одной строке"
+    validate_secret_values
+    save_secrets
 }
 
 print_summary() {
@@ -513,12 +566,15 @@ print_summary() {
     printf '  Samba: \\\\%s\\%s\n' "${ip:-IP-СЕРВЕРА}" "$SAMBA_SHARE_NAME"
     printf '    Логин: %s\n    Пароль: %s\n' "$SAMBA_USER" "$SAMBA_PASS"
     printf '  Медиа: %s\n\n' "$MEDIA_ROOT"
-    warn "Сохраните сгенерированные пароли: повторно они не выводятся."
+    printf '  Файл учётных данных: %s\n' "$SECRETS_FILE"
+    printf '  Просмотр: sudo cat %s\n\n' "$SECRETS_FILE"
+    warn "Файл содержит пароли в открытом виде и доступен только root (права 0600)."
     info "При следующем запуске откроется меню управления."
 }
 
 install_all() {
     mkdir -p -- "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
     printf 'started_at=%s\n' "$(date -u +%FT%TZ)" > "$INSTALLING_MARKER"
     chmod 600 "$INSTALLING_MARKER"
     initialise_secrets
@@ -537,6 +593,7 @@ install_all() {
 
 prepare_management() {
     mkdir -p -- "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
     install_manager_command
     if [[ ! -f "$INSTALL_MARKER" ]]; then
         printf 'adopted_at=%s\n' "$(date -u +%FT%TZ)" > "$INSTALL_MARKER"
