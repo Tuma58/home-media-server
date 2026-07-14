@@ -491,6 +491,138 @@ list_samba_shares() {
     awk '/^\[[^]]+\]/{ if ($0 != "[global]") print "  " $0 }' "$SAMBA_MAIN_CONF"
 }
 
+managed_share_paths() {
+    [[ -f "$SAMBA_SHARES_CONF" ]] || return 0
+    awk '
+        /^# BEGIN TORRENT-DLNA SHARE:/ { managed=1; next }
+        /^# END TORRENT-DLNA SHARE:/ { managed=0; next }
+        managed && /^[[:space:]]*path[[:space:]]*=/ {
+            value=$0
+            sub(/^[^=]*=[[:space:]]*/, "", value)
+            print value
+        }
+    ' "$SAMBA_SHARES_CONF"
+}
+
+permission_issue() {
+    PERMISSION_ISSUES=$((PERMISSION_ISSUES + 1))
+    warn "$*"
+}
+
+safe_permission_target() {
+    valid_absolute_path "$1" || return 1
+    case "$1" in
+        /|/bin|/boot|/dev|/etc|/lib|/lib32|/lib64|/proc|/root|/run|/sbin|/sys|/usr|/var)
+            return 1
+            ;;
+    esac
+}
+
+audit_directory_metadata() {
+    local label=$1 path=$2 expected_owner=${3:-} writer=${4:-}
+    local actual_group actual_owner mode mode_value
+
+    if [[ ! -d "$path" ]]; then
+        permission_issue "$label: каталог не найден: $path"
+        return 0
+    fi
+
+    actual_group=$(stat -c '%G' "$path" 2>/dev/null || true)
+    actual_owner=$(stat -c '%U' "$path" 2>/dev/null || true)
+    mode=$(stat -c '%a' "$path" 2>/dev/null || true)
+
+    [[ "$actual_group" == "$MEDIA_GROUP" ]] || \
+        permission_issue "$label: группа '$actual_group', ожидается '$MEDIA_GROUP' — $path"
+    if [[ -n "$expected_owner" && "$actual_owner" != "$expected_owner" ]]; then
+        permission_issue "$label: владелец '$actual_owner', ожидается '$expected_owner' — $path"
+    fi
+    if [[ "$mode" =~ ^[0-7]+$ ]]; then
+        mode_value=$((8#$mode))
+        (( (mode_value & 8#2070) == 8#2070 )) || \
+            permission_issue "$label: права $mode, требуются setgid и доступ группы rwx — $path"
+    else
+        permission_issue "$label: не удалось определить права — $path"
+    fi
+
+    if [[ -n "$writer" ]]; then
+        if ! id "$writer" >/dev/null 2>&1; then
+            permission_issue "$label: пользователь не найден: $writer"
+        elif ! runuser -u "$writer" -- test -w "$path" || ! runuser -u "$writer" -- test -x "$path"; then
+            permission_issue "$label: пользователь $writer не может записывать/открывать каталог — $path"
+        fi
+    fi
+}
+
+audit_permissions() {
+    PERMISSION_ISSUES=0
+    info "Проверка прав медиакаталогов, SMB-шар и Transmission..."
+
+    if ! getent group "$MEDIA_GROUP" >/dev/null 2>&1; then
+        permission_issue "Группа не найдена: $MEDIA_GROUP"
+    fi
+    if id "$TORRENT_USER" >/dev/null 2>&1; then
+        id -nG "$TORRENT_USER" | tr ' ' '\n' | grep -Fxq "$MEDIA_GROUP" || \
+            permission_issue "$TORRENT_USER не входит в группу $MEDIA_GROUP"
+    else
+        permission_issue "Пользователь Transmission не найден: $TORRENT_USER"
+    fi
+
+    audit_directory_metadata "Корень медиа" "$MEDIA_ROOT"
+    audit_directory_metadata "Загрузки Transmission" "$MEDIA_ROOT/downloads" "$TORRENT_USER" "$TORRENT_USER"
+    audit_directory_metadata "Незавершённые загрузки" "$MEDIA_ROOT/incomplete" "$TORRENT_USER" "$TORRENT_USER"
+    audit_directory_metadata "Watch-каталог" "$MEDIA_ROOT/watch" "$TORRENT_USER" "$TORRENT_USER"
+    audit_directory_metadata "Музыка" "$MEDIA_ROOT/music"
+    audit_directory_metadata "Видео" "$MEDIA_ROOT/video"
+    audit_directory_metadata "Фото" "$MEDIA_ROOT/photo"
+
+    local -a share_paths=()
+    local path
+    mapfile -t share_paths < <(managed_share_paths)
+    for path in "${share_paths[@]}"; do
+        [[ "$path" == "$MEDIA_ROOT" ]] && continue
+        audit_directory_metadata "Управляемая SMB-шара" "$path"
+    done
+
+    if (( PERMISSION_ISSUES == 0 )); then
+        log "Права каталогов корректны"
+    else
+        warn "Обнаружено проблем с правами: $PERMISSION_ISSUES. Откройте пункт 'Права каталогов' для исправления."
+    fi
+}
+
+repair_permissions() {
+    local answer path
+    local -a share_paths=()
+    read -r -p 'Исправить права верхних каталогов без изменения файлов внутри [y/N]: ' answer
+    [[ "$answer" =~ ^[YyДд]$ ]] || return 0
+
+    setup_permissions
+    mapfile -t share_paths < <(managed_share_paths)
+    for path in "${share_paths[@]}"; do
+        safe_permission_target "$path" || { warn "Пропущен небезопасный путь шары: $path"; continue; }
+        mkdir -p -- "$path"
+        chgrp "$MEDIA_GROUP" "$path"
+        chmod 2775 "$path"
+    done
+    systemctl try-restart transmission-daemon 2>/dev/null || true
+    audit_permissions
+}
+
+permissions_menu() {
+    local choice
+    while true; do
+        printf '\n--- Права каталогов ---\n'
+        printf '1) Проверить права\n2) Исправить права верхних каталогов\n0) Назад\n'
+        read -r -p 'Выбор: ' choice
+        case "$choice" in
+            1) audit_permissions ;;
+            2) repair_permissions ;;
+            0) return ;;
+            *) warn "Неизвестный пункт" ;;
+        esac
+    done
+}
+
 configure_samba() {
     info "Настройка Samba..."
     groupadd -f "$MEDIA_GROUP"
@@ -803,13 +935,14 @@ management_menu() {
     local choice
     while true; do
         printf '\n%b=== Torrent + DLNA + SMB: управление ===%b\n' "$GREEN" "$NC"
-        printf '1) SMB: общие папки (шары)\n2) SMB: пользователи\n3) DLNA: управление\n4) Статус сервисов\n0) Выход\n'
+        printf '1) SMB: общие папки (шары)\n2) SMB: пользователи\n3) DLNA: управление\n4) Статус сервисов\n5) Права каталогов\n0) Выход\n'
         read -r -p 'Выбор: ' choice
         case "$choice" in
             1) shares_menu ;;
             2) samba_users_menu ;;
             3) dlna_menu ;;
             4) services_status ;;
+            5) permissions_menu ;;
             0) return ;;
             *) warn "Неизвестный пункт" ;;
         esac
@@ -848,6 +981,7 @@ main() {
     validate_config
     if is_installed; then
         prepare_management
+        audit_permissions
         management_menu
     else
         [[ "${1:-}" != --menu ]] || err "Установка не найдена. Запустите без --menu."
