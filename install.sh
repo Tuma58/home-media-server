@@ -34,6 +34,7 @@ SAMBA_INCLUDE_DIR="${SAMBA_INCLUDE_DIR:-/etc/samba/smb.conf.d}"
 SAMBA_SHARES_CONF="${SAMBA_SHARES_CONF:-$SAMBA_INCLUDE_DIR/torrent-dlna-shares.conf}"
 MINIDLNA_CONF="${MINIDLNA_CONF:-/etc/minidlna.conf}"
 TRANSMISSION_CONF="${TRANSMISSION_CONF:-/etc/transmission-daemon/settings.json}"
+TRANSMISSION_SYSTEMD_OVERRIDE="${TRANSMISSION_SYSTEMD_OVERRIDE:-/etc/systemd/system/transmission-daemon.service.d/10-home-media-server.conf}"
 MANAGER_PATH="${MANAGER_PATH:-/usr/local/sbin/home-media-server}"
 
 require_root() {
@@ -137,6 +138,24 @@ setup_permissions() {
     log "Каталоги готовы: $MEDIA_ROOT"
 }
 
+configure_transmission_systemd_compat() {
+    local unit_type
+    unit_type=$(systemctl show transmission-daemon.service -p Type --value 2>/dev/null || true)
+
+    # Ubuntu 24.04 ships Transmission 4.0.5 with Type=notify, but that build may
+    # never send READY=1. systemd then kills a healthy daemon after 90 seconds.
+    if [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == 24.04 && "$unit_type" == notify ]]; then
+        mkdir -p -- "$(dirname "$TRANSMISSION_SYSTEMD_OVERRIDE")"
+        backup_once "$TRANSMISSION_SYSTEMD_OVERRIDE"
+        cat > "$TRANSMISSION_SYSTEMD_OVERRIDE" <<'EOF'
+[Service]
+Type=simple
+EOF
+        systemctl daemon-reload
+        warn "Применена совместимость systemd для Transmission на Ubuntu 24.04 (Type=simple)"
+    fi
+}
+
 configure_transmission() {
     info "Настройка Transmission..."
     systemctl stop transmission-daemon 2>/dev/null || true
@@ -196,8 +215,14 @@ configure_transmission() {
 EOF
     chown "$TORRENT_USER:$TORRENT_USER" "$TRANSMISSION_CONF"
     chmod 600 "$TRANSMISSION_CONF"
+    configure_transmission_systemd_compat
     systemctl enable transmission-daemon
-    systemctl start transmission-daemon
+    systemctl reset-failed transmission-daemon 2>/dev/null || true
+    if ! systemctl start transmission-daemon; then
+        systemctl --no-pager --full status transmission-daemon >&2 || true
+        journalctl -u transmission-daemon -n 50 --no-pager >&2 || true
+        err "Transmission не запустился; диагностический журнал показан выше"
+    fi
     log "Transmission настроен"
 }
 

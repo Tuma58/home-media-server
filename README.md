@@ -22,6 +22,8 @@ sudo bash -c 'set -Eeuo pipefail; apt-get update; apt-get install -y git ca-cert
 
 Поддерживаются Ubuntu 20.04+ и Debian 11+.
 
+Для известной проблемы Transmission 4.0.5 в Ubuntu 24.04, при которой systemd ожидает отсутствующий сигнал `READY=1` и завершает запуск по timeout, установщик автоматически создаёт отдельный drop-in с `Type=simple`. Другие unit-файлы и пользовательские drop-in не перезаписываются.
+
 ## Повторный запуск и меню управления
 
 ```bash
