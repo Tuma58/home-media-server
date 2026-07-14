@@ -10,11 +10,13 @@
 | MiniDLNA (ReadyMedia) | Раздача видео, музыки и фотографий по DLNA |
 | Samba | Сетевые папки SMB для Windows, macOS и Linux |
 
-## Установка
+## Установка одной командой
 
 ```bash
-sudo bash install.sh
+sudo bash -c 'set -Eeuo pipefail; apt-get update; apt-get install -y curl ca-certificates; tmp=$(mktemp); trap "rm -f $tmp" EXIT; curl -fsSL https://raw.githubusercontent.com/Tuma58/home-media-server/main/install.sh -o "$tmp"; bash "$tmp"'
 ```
+
+Команда устанавливает `curl`, скачивает актуальный скрипт во временный файл, запускает его и удаляет временный файл. Сам скрипт сохраняет команду управления `/usr/local/sbin/home-media-server`.
 
 При первой установке создаются каталоги, пользователи, конфиги и правила UFW (только если UFW уже активен). Если пароли не переданы через окружение, скрипт генерирует случайные пароли и один раз показывает их в итоговой сводке.
 
@@ -23,7 +25,7 @@ sudo bash install.sh
 ## Повторный запуск и меню управления
 
 ```bash
-sudo bash install.sh
+sudo home-media-server
 ```
 
 Повторный запуск не переустанавливает пакеты и не перезаписывает конфиги. Он открывает меню:
@@ -40,9 +42,9 @@ sudo bash install.sh
 Дополнительные команды:
 
 ```bash
-sudo bash install.sh --menu
-sudo bash install.sh --status
-bash install.sh --help
+sudo home-media-server --menu
+sudo home-media-server --status
+home-media-server --help
 ```
 
 ## Настройка первой установки

@@ -34,6 +34,7 @@ SAMBA_INCLUDE_DIR="${SAMBA_INCLUDE_DIR:-/etc/samba/smb.conf.d}"
 SAMBA_SHARES_CONF="${SAMBA_SHARES_CONF:-$SAMBA_INCLUDE_DIR/torrent-dlna-shares.conf}"
 MINIDLNA_CONF="${MINIDLNA_CONF:-/etc/minidlna.conf}"
 TRANSMISSION_CONF="${TRANSMISSION_CONF:-/etc/transmission-daemon/settings.json}"
+MANAGER_PATH="${MANAGER_PATH:-/usr/local/sbin/home-media-server}"
 
 require_root() {
     [[ $EUID -eq 0 ]] || err "Запустите от root: sudo bash install.sh"
@@ -91,6 +92,17 @@ primary_ip() {
 backup_once() {
     local file=$1 backup="$1.torrent-dlna.bak"
     [[ ! -f "$file" || -e "$backup" ]] || cp -a -- "$file" "$backup"
+}
+
+install_manager_command() {
+    local source=${BASH_SOURCE[0]}
+    [[ -f "$source" ]] || { warn "Не удалось сохранить команду управления: исходный скрипт не является файлом"; return 1; }
+    if [[ -e "$MANAGER_PATH" && "$source" -ef "$MANAGER_PATH" ]]; then
+        return 0
+    fi
+    mkdir -p -- "$(dirname "$MANAGER_PATH")"
+    install -m 0755 "$source" "$MANAGER_PATH"
+    log "Команда управления установлена: $MANAGER_PATH"
 }
 
 is_installed() {
@@ -443,6 +455,7 @@ validate_config() {
     valid_groupname "$MEDIA_GROUP" || err "Некорректный MEDIA_GROUP"
     valid_share_name "$SAMBA_SHARE_NAME" || err "Некорректный SAMBA_SHARE_NAME"
     valid_absolute_path "$MEDIA_ROOT" || err "Некорректный MEDIA_ROOT"
+    valid_absolute_path "$MANAGER_PATH" || err "Некорректный MANAGER_PATH"
     valid_single_line "$DLNA_NAME" && [[ "$DLNA_NAME" != *'#'* ]] || \
         err "DLNA_NAME должен быть в одной строке и не содержать #"
     valid_single_line "$TRANSMISSION_USER" || err "TRANSMISSION_USER должен быть в одной строке"
@@ -490,6 +503,7 @@ install_all() {
     configure_minidlna
     configure_samba
     configure_firewall
+    install_manager_command
     printf 'installed_at=%s\n' "$(date -u +%FT%TZ)" > "$INSTALL_MARKER"
     chmod 600 "$INSTALL_MARKER"
     rm -f -- "$INSTALLING_MARKER"
@@ -498,6 +512,7 @@ install_all() {
 
 prepare_management() {
     mkdir -p -- "$STATE_DIR"
+    install_manager_command
     if [[ ! -f "$INSTALL_MARKER" ]]; then
         printf 'adopted_at=%s\n' "$(date -u +%FT%TZ)" > "$INSTALL_MARKER"
         chmod 600 "$INSTALL_MARKER"
