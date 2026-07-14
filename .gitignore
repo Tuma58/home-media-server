@@ -1,0 +1,6 @@
+# Local assistant/tooling context
+.claude/
+CLAUDE.md
+
+# OS metadata
+.DS_Store
