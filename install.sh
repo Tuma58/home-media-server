@@ -18,6 +18,7 @@ MEDIA_GROUP="${MEDIA_GROUP:-media-share}"
 TORRENT_USER="${TORRENT_USER:-debian-transmission}"
 SAMBA_USER="${SAMBA_USER:-media}"
 SAMBA_PASS="${SAMBA_PASS:-}"
+SAMBA_GUEST_USER="${SAMBA_GUEST_USER:-media-guest}"
 DLNA_NAME="${DLNA_NAME:-HomeMedia}"
 DLNA_PORT="${DLNA_PORT:-8200}"
 TRANSMISSION_PORT="${TRANSMISSION_PORT:-9091}"
@@ -350,6 +351,38 @@ samba_share_defined() {
         "$SAMBA_MAIN_CONF" "$SAMBA_SHARES_CONF" 2>/dev/null | grep -Fxiq -- "$name"
 }
 
+ensure_samba_guest_support() {
+    local tmp backup add_map=true add_account=true
+    if ! id "$SAMBA_GUEST_USER" >/dev/null 2>&1; then
+        useradd -M -s /usr/sbin/nologin "$SAMBA_GUEST_USER"
+    fi
+    usermod -aG "$MEDIA_GROUP" "$SAMBA_GUEST_USER"
+
+    grep -Eqi '^[[:space:]]*map to guest[[:space:]]*=' "$SAMBA_SHARES_CONF" && add_map=false
+    grep -Eqi '^[[:space:]]*guest account[[:space:]]*=' "$SAMBA_SHARES_CONF" && add_account=false
+    [[ "$add_map" == true || "$add_account" == true ]] || return 0
+
+    tmp=$(mktemp)
+    backup=$(mktemp)
+    cp -- "$SAMBA_SHARES_CONF" "$backup"
+    awk -v add_map="$add_map" -v add_account="$add_account" -v guest="$SAMBA_GUEST_USER" '
+        { print }
+        /^\[global\][[:space:]]*$/ {
+            if (add_map == "true") print "map to guest = Bad User"
+            if (add_account == "true") print "guest account = " guest
+        }
+    ' "$SAMBA_SHARES_CONF" > "$tmp"
+    install -m 0644 "$tmp" "$SAMBA_SHARES_CONF"
+    rm -f -- "$tmp"
+    if ! samba_config_valid; then
+        cp -- "$backup" "$SAMBA_SHARES_CONF"
+        rm -f -- "$backup"
+        warn "Не удалось включить гостевой доступ Samba; изменение отменено"
+        return 1
+    fi
+    rm -f -- "$backup"
+}
+
 set_samba_password() {
     local username=$1 password=${2:-} password_again
     valid_username "$username" || { warn "Некорректное имя пользователя"; return 1; }
@@ -374,43 +407,64 @@ set_samba_password() {
 }
 
 append_samba_share() {
-    local name=$1 path=$2 users=$3 backup
+    local name=$1 path=$2 users=$3 access_mode=${4:-private} backup read_only
     local -a user_list
     valid_share_name "$name" || { warn "Имя шары: только буквы, цифры, точка, _ и -"; return 1; }
     valid_absolute_path "$path" || { warn "Требуется безопасный абсолютный путь"; return 1; }
-    [[ -n "$users" ]] || { warn "Укажите хотя бы одного пользователя"; return 1; }
+    [[ "$access_mode" =~ ^(private|public-ro|public-rw)$ ]] || { warn "Некорректный режим доступа"; return 1; }
 
-    read -r -a user_list <<< "$users"
-    ((${#user_list[@]} > 0)) || { warn "Укажите хотя бы одного пользователя"; return 1; }
-    users=${user_list[*]}
-    local user
-    for user in "${user_list[@]}"; do
-        if [[ "$user" == @* ]]; then
-            valid_groupname "${user#@}" || { warn "Некорректная группа: $user"; return 1; }
-            getent group "${user#@}" >/dev/null || { warn "Группа не найдена: $user"; return 1; }
-        else
-            valid_username "$user" || { warn "Некорректный пользователь: $user"; return 1; }
-            samba_user_exists "$user" || { warn "Пользователь SMB не найден: $user"; return 1; }
-        fi
-    done
+    if [[ "$access_mode" == private ]]; then
+        [[ -n "$users" ]] || { warn "Укажите хотя бы одного пользователя"; return 1; }
+        read -r -a user_list <<< "$users"
+        ((${#user_list[@]} > 0)) || { warn "Укажите хотя бы одного пользователя"; return 1; }
+        users=${user_list[*]}
+        local user
+        for user in "${user_list[@]}"; do
+            if [[ "$user" == @* ]]; then
+                valid_groupname "${user#@}" || { warn "Некорректная группа: $user"; return 1; }
+                getent group "${user#@}" >/dev/null || { warn "Группа не найдена: $user"; return 1; }
+            else
+                valid_username "$user" || { warn "Некорректный пользователь: $user"; return 1; }
+                samba_user_exists "$user" || { warn "Пользователь SMB не найден: $user"; return 1; }
+            fi
+        done
+    fi
 
     if samba_share_defined "$name"; then
         warn "Шара $name уже существует"
         return 1
     fi
+    if [[ "$access_mode" != private ]]; then
+        ensure_samba_guest_support || return 1
+        [[ "$access_mode" == public-ro ]] && read_only=yes || read_only=no
+    fi
 
     backup=$(mktemp)
     cp -- "$SAMBA_SHARES_CONF" "$backup"
-    cat >> "$SAMBA_SHARES_CONF" <<EOF
+    {
+        cat <<EOF
 
 # BEGIN TORRENT-DLNA SHARE: $name
 [$name]
    comment = Managed media share
    path = $path
    browseable = yes
+EOF
+        if [[ "$access_mode" == private ]]; then
+            cat <<EOF
    read only = no
    guest ok = no
    valid users = $users
+EOF
+        else
+            cat <<EOF
+   read only = $read_only
+   guest ok = yes
+   guest only = yes
+   force user = $SAMBA_GUEST_USER
+EOF
+        fi
+        cat <<EOF
    create mask = 0664
    force create mode = 0660
    directory mask = 2775
@@ -418,6 +472,7 @@ append_samba_share() {
    force group = $MEDIA_GROUP
 # END TORRENT-DLNA SHARE: $name
 EOF
+    } >> "$SAMBA_SHARES_CONF"
     if ! samba_config_valid; then
         cp -- "$backup" "$SAMBA_SHARES_CONF"
         rm -f -- "$backup"
@@ -479,10 +534,16 @@ remove_samba_share() {
 list_samba_shares() {
     printf '\nУправляемые шары:\n'
     awk '
-        /^# BEGIN TORRENT-DLNA SHARE:/ { name=$0; sub(/^# BEGIN TORRENT-DLNA SHARE: /, "", name); path=""; users="" }
+        /^# BEGIN TORRENT-DLNA SHARE:/ { name=$0; sub(/^# BEGIN TORRENT-DLNA SHARE: /, "", name); path=""; users=""; guest="no"; readonly="no" }
         /^[[:space:]]*path[[:space:]]*=/ { path=$0; sub(/^[^=]*=[[:space:]]*/, "", path) }
         /^[[:space:]]*valid users[[:space:]]*=/ { users=$0; sub(/^[^=]*=[[:space:]]*/, "", users) }
-        /^# END TORRENT-DLNA SHARE:/ { printf "  %-20s %s  [%s]\n", name, path, users }
+        /^[[:space:]]*guest ok[[:space:]]*=[[:space:]]*yes/ { guest="yes" }
+        /^[[:space:]]*read only[[:space:]]*=[[:space:]]*yes/ { readonly="yes" }
+        /^# END TORRENT-DLNA SHARE:/ {
+            if (guest == "yes") access=(readonly == "yes" ? "PUBLIC: read-only" : "PUBLIC: read-write")
+            else access="users: " users
+            printf "  %-20s %s  [%s]\n", name, path, access
+        }
     ' "$SAMBA_SHARES_CONF"
     if ! grep -q '^# BEGIN TORRENT-DLNA SHARE:' "$SAMBA_SHARES_CONF"; then
         printf '  (нет)\n'
@@ -504,6 +565,25 @@ managed_share_paths() {
     ' "$SAMBA_SHARES_CONF"
 }
 
+managed_public_share_records() {
+    [[ -f "$SAMBA_SHARES_CONF" ]] || return 0
+    awk '
+        /^# BEGIN TORRENT-DLNA SHARE:/ { managed=1; path=""; guest="no"; readonly="no"; next }
+        /^# END TORRENT-DLNA SHARE:/ {
+            if (managed && guest == "yes" && path != "")
+                print (readonly == "yes" ? "read" : "write") "\t" path
+            managed=0
+            next
+        }
+        managed && /^[[:space:]]*path[[:space:]]*=/ {
+            path=$0
+            sub(/^[^=]*=[[:space:]]*/, "", path)
+        }
+        managed && /^[[:space:]]*guest ok[[:space:]]*=[[:space:]]*yes/ { guest="yes" }
+        managed && /^[[:space:]]*read only[[:space:]]*=[[:space:]]*yes/ { readonly="yes" }
+    ' "$SAMBA_SHARES_CONF"
+}
+
 permission_issue() {
     PERMISSION_ISSUES=$((PERMISSION_ISSUES + 1))
     warn "$*"
@@ -518,8 +598,21 @@ safe_permission_target() {
     esac
 }
 
+audit_user_directory_access() {
+    local label=$1 path=$2 writer=$3 required_access=${4:-write}
+    if ! id "$writer" >/dev/null 2>&1; then
+        permission_issue "$label: пользователь не найден: $writer"
+    elif [[ "$required_access" == read ]]; then
+        if ! runuser -u "$writer" -- test -r "$path" || ! runuser -u "$writer" -- test -x "$path"; then
+            permission_issue "$label: пользователь $writer не может читать/открывать каталог — $path"
+        fi
+    elif ! runuser -u "$writer" -- test -w "$path" || ! runuser -u "$writer" -- test -x "$path"; then
+        permission_issue "$label: пользователь $writer не может записывать/открывать каталог — $path"
+    fi
+}
+
 audit_directory_metadata() {
-    local label=$1 path=$2 expected_owner=${3:-} writer=${4:-}
+    local label=$1 path=$2 expected_owner=${3:-} writer=${4:-} required_access=${5:-write}
     local actual_group actual_owner mode mode_value
 
     if [[ ! -d "$path" ]]; then
@@ -544,13 +637,7 @@ audit_directory_metadata() {
         permission_issue "$label: не удалось определить права — $path"
     fi
 
-    if [[ -n "$writer" ]]; then
-        if ! id "$writer" >/dev/null 2>&1; then
-            permission_issue "$label: пользователь не найден: $writer"
-        elif ! runuser -u "$writer" -- test -w "$path" || ! runuser -u "$writer" -- test -x "$path"; then
-            permission_issue "$label: пользователь $writer не может записывать/открывать каталог — $path"
-        fi
-    fi
+    [[ -z "$writer" ]] || audit_user_directory_access "$label" "$path" "$writer" "$required_access"
 }
 
 audit_permissions() {
@@ -583,6 +670,22 @@ audit_permissions() {
         audit_directory_metadata "Управляемая SMB-шара" "$path"
     done
 
+    local -a public_records=()
+    local record access
+    mapfile -t public_records < <(managed_public_share_records)
+    if ((${#public_records[@]} > 0)); then
+        if ! id "$SAMBA_GUEST_USER" >/dev/null 2>&1; then
+            permission_issue "Гостевой пользователь Samba не найден: $SAMBA_GUEST_USER"
+        elif ! id -nG "$SAMBA_GUEST_USER" | tr ' ' '\n' | grep -Fxq "$MEDIA_GROUP"; then
+            permission_issue "$SAMBA_GUEST_USER не входит в группу $MEDIA_GROUP"
+        fi
+    fi
+    for record in "${public_records[@]}"; do
+        access=${record%%$'\t'*}
+        path=${record#*$'\t'}
+        [[ -d "$path" ]] && audit_user_directory_access "Общедоступная SMB-шара" "$path" "$SAMBA_GUEST_USER" "$access"
+    done
+
     if (( PERMISSION_ISSUES == 0 )); then
         log "Права каталогов корректны"
     else
@@ -597,6 +700,9 @@ repair_permissions() {
     [[ "$answer" =~ ^[YyДд]$ ]] || return 0
 
     setup_permissions
+    if managed_public_share_records | grep -q .; then
+        ensure_samba_guest_support
+    fi
     mapfile -t share_paths < <(managed_share_paths)
     for path in "${share_paths[@]}"; do
         safe_permission_target "$path" || { warn "Пропущен небезопасный путь шары: $path"; continue; }
@@ -657,6 +763,7 @@ validate_config() {
     valid_port "$TRANSMISSION_PORT" || err "Некорректный TRANSMISSION_PORT"
     valid_port "$DLNA_PORT" || err "Некорректный DLNA_PORT"
     valid_username "$SAMBA_USER" || err "Некорректный SAMBA_USER"
+    valid_username "$SAMBA_GUEST_USER" || err "Некорректный SAMBA_GUEST_USER"
     valid_username "$TORRENT_USER" || err "Некорректный TORRENT_USER"
     valid_groupname "$MEDIA_GROUP" || err "Некорректный MEDIA_GROUP"
     valid_share_name "$SAMBA_SHARE_NAME" || err "Некорректный SAMBA_SHARE_NAME"
@@ -753,10 +860,10 @@ confirm_partial_install() {
 
 shares_menu() {
     ensure_samba_include || return 0
-    local choice name path users answer
+    local choice name path users answer access_mode
     while true; do
         printf '\n--- SMB: общие папки ---\n'
-        printf '1) Показать шары\n2) Добавить шару\n3) Удалить шару\n4) Проверить конфигурацию\n0) Назад\n'
+        printf '1) Показать шары\n2) Добавить приватную шару\n3) Добавить общедоступную шару\n4) Удалить шару\n5) Проверить конфигурацию\n0) Назад\n'
         read -r -p 'Выбор: ' choice
         case "$choice" in
             1) list_samba_shares ;;
@@ -769,12 +876,19 @@ shares_menu() {
                 append_samba_share "$name" "$path" "$users" || true
                 ;;
             3)
+                read -r -p 'Имя общедоступной шары (без пробелов): ' name
+                read -r -p 'Абсолютный путь: ' path
+                read -r -p 'Разрешить гостям запись? По умолчанию только чтение [y/N]: ' answer
+                [[ "$answer" =~ ^[YyДд]$ ]] && access_mode=public-rw || access_mode=public-ro
+                append_samba_share "$name" "$path" "" "$access_mode" || true
+                ;;
+            4)
                 list_samba_shares
                 read -r -p 'Имя управляемой шары: ' name
                 read -r -p "Удалить шару $name из Samba? Данные останутся [y/N]: " answer
                 [[ "$answer" =~ ^[YyДд]$ ]] && remove_samba_share "$name" || true
                 ;;
-            4)
+            5)
                 if samba_config_valid; then log "Конфигурация Samba корректна"; else warn "Ошибка в конфигурации Samba"; fi
                 ;;
             0) return ;;
